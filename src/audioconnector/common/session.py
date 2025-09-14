@@ -1,0 +1,325 @@
+import json
+import logging
+from typing import Dict, Any, Optional, Union, List
+
+from fastapi import WebSocket
+
+from ..protocol.core import JsonStringMap, MediaParameter
+from ..protocol.message import (
+    ClientMessage, DisconnectParameters, DisconnectReason, 
+    EventParameters, ServerMessage, ServerMessageType, 
+    SelectParametersForType
+)
+from ..protocol.voice_bots import (
+    BotTurnDisposition, EventEntityBargeIn, 
+    EventEntityBotTurnResponse
+)
+from ..websocket.message_handlers.message_handler_registry import MessageHandlerRegistry
+from ..services.bot_service import BotService, BotResource, BotResponse
+from ..services.asr_service import ASRService, Transcript
+from ..services.dtmf_service import DTMFService
+
+class Session:
+    def __init__(self, ws: WebSocket, session_id: str, url: str):
+        self.MAXIMUM_BINARY_MESSAGE_SIZE = 64000
+        self.disconnecting = False
+        self.closed = False
+        self.ws = ws
+
+        self.message_handler_registry = MessageHandlerRegistry()
+        self.bot_service = BotService()
+        self.asr_service: Optional[ASRService] = None
+        self.dtmf_service: Optional[DTMFService] = None
+        self.url = url
+        self.client_session_id = session_id
+        self.conversation_id: Optional[str] = None
+        self.last_server_sequence_number = 0
+        self.last_client_sequence_number = 0
+        self.input_variables: JsonStringMap = {}
+        self.selected_media: Optional[MediaParameter] = None
+        self.selected_bot: Optional[BotResource] = None
+        self.is_capturing_dtmf = False
+        self.is_audio_playing = False
+        self.logger = logging.getLogger(__name__)
+
+    async def close(self):
+        """Close the WebSocket connection"""
+        if self.closed:
+            return
+
+        try:
+            await self.ws.close()
+        except Exception:
+            pass
+
+        self.closed = True
+
+    def set_conversation_id(self, conversation_id: str):
+        """Set the conversation ID"""
+        self.conversation_id = conversation_id
+
+    def set_input_variables(self, input_variables: JsonStringMap):
+        """Set input variables"""
+        self.input_variables = input_variables
+
+    def set_selected_media(self, selected_media: MediaParameter):
+        """Set selected media"""
+        self.selected_media = selected_media
+
+    def set_is_audio_playing(self, is_audio_playing: bool):
+        """Set audio playing status"""
+        self.is_audio_playing = is_audio_playing
+
+    async def process_text_message(self, data: str):
+        """Process incoming text message"""
+        if self.closed:
+            return
+
+        try:
+            message = json.loads(data)
+        except json.JSONDecodeError:
+            self.logger.error("Invalid JSON message")
+            await self.send_disconnect('error', 'Invalid message format', {})
+            return
+
+        # Validate sequence numbers and session ID
+        if message.get('seq') != self.last_client_sequence_number + 1:
+            self.logger.error(f"Invalid client sequence number: {message.get('seq')}")
+            await self.send_disconnect('error', 'Invalid client sequence number', {})
+            return
+
+        self.last_client_sequence_number = message.get('seq', 0)
+
+        if message.get('serverseq', 0) > self.last_server_sequence_number:
+            self.logger.error(f"Invalid server sequence number: {message.get('serverseq')}")
+            await self.send_disconnect('error', 'Invalid server sequence number', {})
+            return
+
+        if message.get('id') != self.client_session_id:
+            self.logger.error(f"Invalid Client Session ID: {message.get('id')}")
+            await self.send_disconnect('error', 'Invalid ID specified', {})
+            return
+
+        # Find and execute message handler
+        handler = self.message_handler_registry.get_handler(message.get('type'))
+        if not handler:
+            self.logger.error(f"Cannot find a message handler for '{message.get('type')}'")
+            return
+
+        await handler.handle_message(message, self)
+
+    def create_message(self, type: ServerMessageType, parameters: Any) -> ServerMessage:
+        """Create a server message"""
+        # Increment last_server_sequence_number before creating the message
+        self.last_server_sequence_number += 1
+        
+        message = {
+            'id': self.client_session_id,
+            'version': '2',
+            'seq': self.last_server_sequence_number,
+            'clientseq': self.last_client_sequence_number,
+            'type': type,
+            'parameters': parameters
+        }
+        return message
+
+    async def send(self, message: ServerMessage):
+        """Send a message over WebSocket"""
+        if message['type'] == 'event':
+            self.logger.info(f"Sending an event message: {message['parameters']['entities'][0]['type']}")
+        else:
+            self.logger.info(f"Sending a {message['type']} message")
+        
+        await self.ws.send_text(json.dumps(message))
+
+    async def send_audio(self, bytes_data: bytes):
+        """Send audio data, potentially chunked"""
+        if len(bytes_data) <= self.MAXIMUM_BINARY_MESSAGE_SIZE:
+            self.logger.info(f"Sending {len(bytes_data)} binary bytes in 1 message")
+            await self.ws.send_bytes(bytes_data)
+        else:
+            current_position = 0
+            while current_position < len(bytes_data):
+                send_bytes = bytes_data[current_position:current_position + self.MAXIMUM_BINARY_MESSAGE_SIZE]
+                self.logger.info(f"Sending {len(send_bytes)} binary bytes in chunked message")
+                await self.ws.send_bytes(send_bytes)
+                current_position += self.MAXIMUM_BINARY_MESSAGE_SIZE
+
+    async def send_barge_in(self):
+        """Send barge-in event"""
+        barge_in_event: EventEntityBargeIn = {
+            'type': 'barge_in',
+            'data': {}
+        }
+        message = self.create_message('event', {
+            'entities': [barge_in_event]
+        })
+        await self.send(message)
+
+    async def send_turn_response(self, disposition: BotTurnDisposition, text: Optional[str], confidence: Optional[float]):
+        """Send bot turn response event"""
+        bot_turn_response_event: EventEntityBotTurnResponse = {
+            'type': 'bot_turn_response',
+            'data': {
+                'disposition': disposition,
+                'text': text,
+                'confidence': confidence
+            }
+        }
+        message = self.create_message('event', {
+            'entities': [bot_turn_response_event]
+        })
+        await self.send(message)
+
+    async def send_disconnect(self, reason: DisconnectReason, info: str, output_variables: JsonStringMap):
+        """Send disconnect message"""
+        self.disconnecting = True
+        
+        disconnect_parameters: DisconnectParameters = {
+            'reason': reason,
+            'info': info,
+            'outputVariables': output_variables
+        }
+        message = self.create_message('disconnect', disconnect_parameters)
+        await self.send(message)
+
+    async def send_closed(self):
+        """Send closed message"""
+        message = self.create_message('closed', {})
+        await self.send(message)
+
+    async def check_if_bot_exists(self) -> bool:
+        """Check if bot exists"""
+        selected_bot = await self.bot_service.get_bot_if_exists(self.url, self.input_variables)
+        self.selected_bot = selected_bot
+        return self.selected_bot is not None
+
+    async def process_bot_start(self):
+        """Process bot start"""
+        if not self.selected_bot:
+            return
+
+        response = await self.selected_bot.get_initial_response()
+        if response.text:
+            await self.send_turn_response(response.disposition, response.text, response.confidence)
+
+        if response.audio_bytes:
+            await self.send_audio(response.audio_bytes)
+
+    async def process_binary_message(self, data: bytes):
+        """
+        Process incoming binary message (audio)
+        
+        Args:
+            data: Binary audio data
+        """
+        if self.disconnecting or self.closed or not self.selected_bot:
+            return
+
+        # Ignore audio if capturing DTMF
+        if self.is_capturing_dtmf:
+            return
+
+        # Ignore input while audio is playing
+        if self.is_audio_playing:
+            self.asr_service = None
+            self.dtmf_service = None
+            return
+
+        # Initialize or reset ASR service
+        if not self.asr_service or self.asr_service.get_state() == 'Complete':
+            self.asr_service = ASRService()
+            
+            # Error handling
+            self.asr_service.on('error', self._handle_asr_error)
+            
+            # Final transcript handling
+            self.asr_service.on('final-transcript', self._handle_final_transcript)
+
+        # Process audio
+        self.asr_service.process_audio(data)
+
+    def process_dtmf(self, digit: str):
+        """
+        Process DTMF digit
+        
+        Args:
+            digit: DTMF digit received
+        """
+        if self.disconnecting or self.closed or not self.selected_bot:
+            return
+
+        # Ignore input while audio is playing
+        if self.is_audio_playing:
+            self.asr_service = None
+            self.dtmf_service = None
+            return
+
+        # If we are not capturing DTMF, start capturing
+        if not self.is_capturing_dtmf:
+            self.is_capturing_dtmf = True
+            self.asr_service = None
+
+        if not self.dtmf_service or self.dtmf_service.get_state() == 'Complete':
+            self.dtmf_service = DTMFService()
+            
+            # Error handling
+            self.dtmf_service.on('error', self._handle_dtmf_error)
+            
+            # Final digits handling
+            self.dtmf_service.on('final-digits', self._handle_final_dtmf)
+
+        # Process digit
+        self.dtmf_service.process_digit(digit)
+
+    async def _handle_asr_error(self, error: Any):
+        """Handle ASR service errors"""
+        if self.is_capturing_dtmf:
+            return
+        
+        message = 'Error during Speech Recognition.'
+        self.logger.error(f"{message}: {error}")
+        await self.send_disconnect('error', message, {})
+
+    async def _handle_final_transcript(self, transcript: Transcript):
+        """Handle final transcript from ASR"""
+        if self.is_capturing_dtmf:
+            return
+        
+        if not self.selected_bot:
+            return
+
+        response = await self.selected_bot.get_bot_response(transcript.text)
+        
+        if response.text:
+            await self.send_turn_response(response.disposition, response.text, response.confidence)
+
+        if response.audio_bytes:
+            await self.send_audio(response.audio_bytes)
+
+        if response.end_session:
+            await self.send_disconnect('completed', '', {})
+
+    async def _handle_dtmf_error(self, error: Any):
+        """Handle DTMF service errors"""
+        message = 'Error during DTMF Capture.'
+        self.logger.error(f"{message}: {error}")
+        await self.send_disconnect('error', message, {})
+
+    async def _handle_final_dtmf(self, digits: str):
+        """Handle final DTMF digits"""
+        if not self.selected_bot:
+            return
+
+        response = await self.selected_bot.get_bot_response(digits)
+        
+        if response.text:
+            await self.send_turn_response(response.disposition, response.text, response.confidence)
+
+        if response.audio_bytes:
+            await self.send_audio(response.audio_bytes)
+
+        if response.end_session:
+            await self.send_disconnect('completed', '', {})
+
+        self.is_capturing_dtmf = False

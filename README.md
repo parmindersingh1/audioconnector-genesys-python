@@ -1,28 +1,82 @@
-# AudioConnector Server Reference Guide
+# AudioConnector Server - FastAPI Reference Implementation
 
-### Purpose
-This repository contains a sample implementation for an AudioConnector Server. This is to be used as a guide to help understand some of the basics of setting up an AudioConnector Server. It is not intended for production purposes. Protocol documentation can be found on the [Genesys Developer Portal](https://developer.genesys.cloud/devapps/audiohook/).
+## Overview
+This is a Python FastAPI implementation of the AudioConnector server, providing WebSocket-based communication for audio processing and bot interactions.
 
-### Things to look at to get started
+## Prerequisites
+- Python 3.9+
+- pip
+- (Optional) venv or conda for virtual environment
 
-#### The main session object
-The [Session](./src/common/session.ts) class contains methods and logic that handle communicating with the AudioConnector Client.
+## Setup
 
-The [ASRService](./src/services/asr-service.ts) class is responsible for interpreting the incoming audio from the AudioConnector Server. A fake implementation has been provided, and will need to be replaced with an actual ASR engine.
+### 1. Clone the Repository
+```bash
+git clone <repository-url>
+cd audioconnector-server-reference-implementation
+```
 
-The [BotService](./src/services/bot-service.ts) class is responsible for getting the metadata for a specified Bot, as well as interacting with the Bot itself. For example, this service would be used to match a Bot's response to the input received/interpreted from the `ASRService` and `DTMFService` services. A fake implementation has been provided, and will need to be replaced with an actual Bot engine.
+### 2. Create a Virtual Environment (Recommended)
+```bash
+python3 -m venv venv
+source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+```
 
-The [DTMFService](./src/services/dtmf-service.ts) class is responsible for interpreting any DTMF digits received from the AudioConnector Client. A base implementation has been provded as a start, but will need to be adjusted to meet any specific requirements for the AudioConnector Server.
+### 3. Install Dependencies
+```bash
+pip install -r requirements.txt
+```
 
-The [SecretService](./src/services/secret-service.ts) class is responsible for looking up the secret from a given API Key used during the initial authentication process. A fake implementation has been provided, and will need to be replaced to lookup secrets with whatever service they are stored in.
+### 4. Environment Configuration
+Create a `.env` file in the project root with the following configurations:
+```bash
+# Create .env file
+touch .env
+```
 
-The [TTSService](./src/services/tts-service.ts) class is responsible for converting text-based responses from the Bot to the appropriate audio to be sent to the AudioConnector Client. A fake implementation has been provided, and will need to be replaces with an actual TTS engine.
+Add the following content to the `.env` file:
+```
+# Server Configuration
+PORT=8080
+LOG_LEVEL=INFO
 
-### Running the server
+# Add any additional environment-specific configurations
+```
 
-#### Requirements
-This implementation was written using NodeJS 18.16.0 as a target. If you are using a Node version manager, there is a [nvmrc](./.nvmrc) file that specifies this version.
+## Running the Application
 
-#### Steps to run the server locally
-1) Run `npm install` in the root of the project.
-2) Run `npm run start` in the root of the project to start the server. The port can be adjusted from within the [environment](./.env) file.
+### Development Mode
+```bash
+uvicorn src.audioconnector.main:app --reload
+```
+
+### Production Mode
+```bash
+uvicorn src.audioconnector.main:app --host 0.0.0.0 --port 8080
+```
+
+## WebSocket Endpoint
+- URL: `ws://localhost:8080/ws`
+
+## Project Structure
+- `src/audioconnector/`: Main application code
+  - `main.py`: FastAPI application entry point
+  - `websocket/`: WebSocket server implementation
+  - `services/`: Core service implementations
+  - `auth/`: Authentication and signature verification
+  - `protocol/`: Message and protocol definitions
+
+## Development Notes
+- This is a reference implementation with placeholder services
+- Replace placeholder services with actual implementations as needed
+- Implement proper error handling and logging in production
+
+## Contributing
+1. Fork the repository
+2. Create your feature branch
+3. Commit your changes
+4. Push to the branch
+5. Create a new Pull Request
+
+## License
+[Specify your license here]
