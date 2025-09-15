@@ -21,13 +21,18 @@ class WebSocketServer:
         Args:
             websocket: Incoming WebSocket connection
         """
+        session = None
         try:
             # Verify request signature
             verify_result = await verify_websocket_signature(websocket, self.secret_service)
             
             if verify_result.get('code') != 'VERIFIED':
                 self.logger.warning(f"Authentication failed: {verify_result.get('reason', 'Unknown reason')}")
-                await websocket.close(code=4001)
+                # Use a try-except to handle potential errors during close
+                try:
+                    await websocket.close(code=4001)
+                except Exception as close_error:
+                    self.logger.error(f"Error closing websocket: {close_error}")
                 return
 
             await websocket.accept()
@@ -38,8 +43,8 @@ class WebSocketServer:
             session = Session(websocket, session_id, websocket.url.path)
             self.session_map[websocket] = session
 
-            try:
-                while True:
+            while True:
+                try:
                     # Receive either text or binary message
                     data = await websocket.receive()
                     
@@ -48,14 +53,26 @@ class WebSocketServer:
                             await session.process_text_message(data['text'])
                         elif 'bytes' in data:
                             await session.process_binary_message(data['bytes'])
-            except WebSocketDisconnect:
-                self.logger.info('WebSocket connection closed.')
-            finally:
-                await self.delete_connection(websocket)
+                except WebSocketDisconnect:
+                    self.logger.info('WebSocket connection closed by client.')
+                    break
 
         except Exception as e:
             self.logger.error(f'WebSocket error: {e}')
-            await websocket.close(code=4000)
+            # Ensure we don't try to close an already closed connection
+            try:
+                if websocket.client_state != websocket.DISCONNECTED:
+                    await websocket.close(code=4000)
+            except Exception as close_error:
+                self.logger.error(f"Error during websocket close: {close_error}")
+        
+        finally:
+            # Always attempt to delete the connection, even if there was an error
+            if session and websocket in self.session_map:
+                try:
+                    await self.delete_connection(websocket)
+                except Exception as delete_error:
+                    self.logger.error(f"Error deleting connection: {delete_error}")
 
     async def delete_connection(self, websocket: WebSocket):
         """
@@ -68,7 +85,12 @@ class WebSocketServer:
         if session:
             try:
                 await session.close()
-            except Exception:
-                pass
-            del self.session_map[websocket]
+            except Exception as close_error:
+                self.logger.error(f"Error closing session: {close_error}")
+            
+            try:
+                del self.session_map[websocket]
+            except Exception as del_error:
+                self.logger.error(f"Error removing session from map: {del_error}")
+            
             self.logger.info('Deleting session.')
