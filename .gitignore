@@ -40,3 +40,4 @@ Thumbs.db
 *.mov
 *.wmv
 .env
+src/audioconnector/services/__pycache__
