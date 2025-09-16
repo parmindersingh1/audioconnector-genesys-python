@@ -1,5 +1,10 @@
 import logging
 from fastapi import WebSocket, WebSocketDisconnect
+import os
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 from ..auth.authenticator import verify_websocket_signature
 from ..common.session import Session
@@ -13,6 +18,8 @@ class WebSocketServer:
         self.session_map = {}
         self.secret_service = SecretService()
         self.logger = logging.getLogger(__name__)
+        # Get LiveKit URL from environment, with a default fallback
+        self.livekit_url = os.getenv('LIVEKIT_TOKEN_URL', 'https://lks.whilter.ai/token').replace('/token', '')
 
     async def handle_websocket(self, websocket: WebSocket):
         """
@@ -40,7 +47,11 @@ class WebSocketServer:
 
             # Create session
             session_id = websocket.headers.get('audiohook-session-id', '')
-            session = Session(websocket, session_id, websocket.url.path)
+            session = Session(
+                websocket, 
+                session_id, 
+                livekit_url=self.livekit_url
+            )
             self.session_map[websocket] = session
 
             while True:

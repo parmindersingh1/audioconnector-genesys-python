@@ -15,37 +15,63 @@ from ..protocol.voice_bots import (
     EventEntityBotTurnResponse
 )
 from ..websocket.message_handlers.message_handler_registry import MessageHandlerRegistry
-from ..services.bot_service import BotService, BotResource, BotResponse
-from ..services.asr_service import ASRService, Transcript
-from ..services.dtmf_service import DTMFService
+from ..services.livekit_agent_service import AgentBotService, AgentBotResource, AgentBotResponse, LiveKitAgentService
+from ..services.dtmf_service import DTMFService  # Keep DTMF service for local processing
 
 class Session:
-    def __init__(self, ws: WebSocket, session_id: str, url: str):
+    def __init__(self, ws: WebSocket, session_id: str, 
+                 livekit_url: str, 
+                 email: Optional[str] = None,
+                 mobile_number: Optional[str] = None,
+                 stt: str = 'Self-Hosted',
+                 llm: str = 'Self-Hosted',
+                 tts: str = 'Self-Hosted',
+                 org_id: Optional[str] = None):
         self.MAXIMUM_BINARY_MESSAGE_SIZE = 64000
         self.disconnecting = False
         self.closed = False
         self.ws = ws
 
         self.message_handler_registry = MessageHandlerRegistry()
-        self.bot_service = BotService()
-        self.asr_service: Optional[ASRService] = None
+        
+        # Prepare input variables for LiveKit agent service
+        self.input_variables = {
+            'session_id': session_id,
+            'email': email,
+            'mobile_number': mobile_number,
+            'stt': stt,
+            'llm': llm,
+            'tts': tts,
+            'orgId': org_id
+        }
+        
+        # Replace bot_service with agent-based service
+        self.bot_service = AgentBotService(livekit_url)
+        
+        # Remove ASR service - handled by LiveKit agent
+        self.agent_service: Optional[LiveKitAgentService] = None
+        
+        # Keep DTMF service for local DTMF processing if needed
         self.dtmf_service: Optional[DTMFService] = None
-        self.url = url
+        
         self.client_session_id = session_id
         self.conversation_id: Optional[str] = None
         self.last_server_sequence_number = 0
         self.last_client_sequence_number = 0
-        self.input_variables: JsonStringMap = {}
         self.selected_media: Optional[MediaParameter] = None
-        self.selected_bot: Optional[BotResource] = None
+        self.selected_bot: Optional[AgentBotResource] = None
         self.is_capturing_dtmf = False
         self.is_audio_playing = False
         self.logger = logging.getLogger(__name__)
 
     async def close(self):
-        """Close the WebSocket connection"""
+        """Close the WebSocket connection and disconnect from agent"""
         if self.closed:
             return
+
+        # Disconnect from LiveKit agent
+        if self.agent_service:
+            await self.agent_service.disconnect()
 
         try:
             await self.ws.close()
@@ -61,6 +87,8 @@ class Session:
     def set_input_variables(self, input_variables: JsonStringMap):
         """Set input variables"""
         self.input_variables = input_variables
+        # Add session ID for agent identification
+        self.input_variables['session_id'] = self.client_session_id
 
     def set_selected_media(self, selected_media: MediaParameter):
         """Set selected media"""
@@ -110,7 +138,6 @@ class Session:
 
     def create_message(self, type: ServerMessageType, parameters: Any) -> ServerMessage:
         """Create a server message"""
-        # Increment last_server_sequence_number before creating the message
         self.last_server_sequence_number += 1
         
         message = {
@@ -189,9 +216,23 @@ class Session:
         await self.send(message)
 
     async def check_if_bot_exists(self) -> bool:
-        """Check if bot exists"""
-        selected_bot = await self.bot_service.get_bot_if_exists(self.url, self.input_variables)
+        """Check if bot exists and connect to LiveKit agent"""
+        # Use the LiveKit URL or a connection URL from input variables
+        connection_url = self.input_variables.get('connection_url', 'https://lks.whilter.ai')
+        
+        selected_bot = await self.bot_service.get_bot_if_exists(connection_url, self.input_variables)
         self.selected_bot = selected_bot
+        
+        if self.selected_bot:
+            # Get the agent service reference from the bot resource
+            self.agent_service = self.selected_bot.agent_service
+            
+            # Setup agent event handlers for this session
+            self.agent_service.on('agent_transcript', self._handle_agent_transcript)
+            self.agent_service.on('agent_audio_track', self._handle_agent_audio)
+            self.agent_service.on('agent_error', self._handle_agent_error)
+            self.agent_service.on('disconnected', self._handle_agent_disconnected)
+        
         return self.selected_bot is not None
 
     async def process_bot_start(self):
@@ -199,19 +240,24 @@ class Session:
         if not self.selected_bot:
             return
 
+        print("^^^^^^^^^^^^^^^^^^")    
+
         response = await self.selected_bot.get_initial_response()
         if response.text:
-            await self.send_turn_response(response.disposition, response.text, response.confidence)
+            await self.send_turn_response('match', response.text, response.confidence)
 
-        if response.audio_bytes:
-            await self.send_audio(response.audio_bytes)
+        # For LiveKit agents, audio is handled through audio tracks, not direct bytes
+        if response.audio_track:
+            # Audio will be streamed through the LiveKit connection
+            # We might need to notify the WebSocket client about audio availability
+            pass
 
     async def process_binary_message(self, data: bytes):
         """
-        Process incoming binary message (audio)
+        Process incoming binary message (audio) - send to LiveKit agent
         
         Args:
-            data: Binary audio data
+            data: Binary audio data from WebSocket
         """
         if self.disconnecting or self.closed or not self.selected_bot:
             return
@@ -222,26 +268,15 @@ class Session:
 
         # Ignore input while audio is playing
         if self.is_audio_playing:
-            self.asr_service = None
-            self.dtmf_service = None
             return
 
-        # Initialize or reset ASR service
-        if not self.asr_service or self.asr_service.get_state() == 'Complete':
-            self.asr_service = ASRService()
-            
-            # Error handling
-            self.asr_service.on('error', self._handle_asr_error)
-            
-            # Final transcript handling
-            self.asr_service.on('final-transcript', self._handle_final_transcript)
-
-        # Process audio
-        self.asr_service.process_audio(data)
+        # Send audio data to LiveKit agent instead of local ASR
+        if self.agent_service and self.agent_service.get_state() == 'connected':
+            await self.agent_service.send_audio(data)
 
     def process_dtmf(self, digit: str):
         """
-        Process DTMF digit
+        Process DTMF digit - can send to agent or handle locally
         
         Args:
             digit: DTMF digit received
@@ -251,55 +286,51 @@ class Session:
 
         # Ignore input while audio is playing
         if self.is_audio_playing:
-            self.asr_service = None
-            self.dtmf_service = None
             return
 
-        # If we are not capturing DTMF, start capturing
+        # Send DTMF to LiveKit agent
+        if self.agent_service and self.agent_service.get_state() == 'connected':
+            asyncio.create_task(self.agent_service.send_dtmf(digit))
+        else:
+            # Fallback to local DTMF processing
+            self._process_local_dtmf(digit)
+
+    def _process_local_dtmf(self, digit: str):
+        """Process DTMF locally if agent is not available"""
         if not self.is_capturing_dtmf:
             self.is_capturing_dtmf = True
-            self.asr_service = None
 
         if not self.dtmf_service or self.dtmf_service.get_state() == 'Complete':
             self.dtmf_service = DTMFService()
-            
-            # Error handling
             self.dtmf_service.on('error', self._handle_dtmf_error)
-            
-            # Final digits handling
             self.dtmf_service.on('final-digits', self._handle_final_dtmf)
 
-        # Process digit
         self.dtmf_service.process_digit(digit)
 
-    async def _handle_asr_error(self, error: Any):
-        """Handle ASR service errors"""
-        if self.is_capturing_dtmf:
-            return
-        
-        message = 'Error during Speech Recognition.'
-        self.logger.error(f"{message}: {error}")
-        await self.send_disconnect('error', message, {})
+    # Agent event handlers
+    async def _handle_transcription(self, text: str, role: str, identity: str):
+        """Handle transcription from LiveKit agent"""
+        self.logger.info(f"Transcription from {role}: {text}")
+        # You might want to emit this as an intermediate transcript event
+        # or forward it to the WebSocket client
 
-    async def _handle_final_transcript(self, transcript: Transcript):
-        """Handle final transcript from ASR"""
-        if self.is_capturing_dtmf:
-            return
-        
-        if not self.selected_bot:
-            return
+    async def _handle_agent_audio(self, audio_track):
+        """Handle audio track from LiveKit agent"""
+        self.logger.info("Agent audio track available")
+        # The audio will be handled by the LiveKit client
+        # You might want to notify the WebSocket about audio availability
 
-        response = await self.selected_bot.get_bot_response(transcript.text)
-        
-        if response.text:
-            await self.send_turn_response(response.disposition, response.text, response.confidence)
+    async def _handle_agent_error(self, error: str):
+        """Handle error from LiveKit agent"""
+        self.logger.error(f"Agent error: {error}")
+        await self.send_disconnect('error', f'Agent error: {error}', {})
 
-        if response.audio_bytes:
-            await self.send_audio(response.audio_bytes)
+    async def _handle_agent_disconnected(self):
+        """Handle agent disconnection"""
+        self.logger.info("Agent disconnected")
+        await self.send_disconnect('completed', 'Agent session ended', {})
 
-        if response.end_session:
-            await self.send_disconnect('completed', '', {})
-
+    # Legacy DTMF handlers (fallback)
     async def _handle_dtmf_error(self, error: Any):
         """Handle DTMF service errors"""
         message = 'Error during DTMF Capture.'
@@ -314,10 +345,7 @@ class Session:
         response = await self.selected_bot.get_bot_response(digits)
         
         if response.text:
-            await self.send_turn_response(response.disposition, response.text, response.confidence)
-
-        if response.audio_bytes:
-            await self.send_audio(response.audio_bytes)
+            await self.send_turn_response('match', response.text, response.confidence)
 
         if response.end_session:
             await self.send_disconnect('completed', '', {})

@@ -43,3 +43,8 @@ Thumbs.db
 src/audioconnector/services/__pycache__
 venv
 *.pyc
+# Python compiled files
+**/*.pyc
+**/__pycache__/
+*.pyc
+__pycache__/
