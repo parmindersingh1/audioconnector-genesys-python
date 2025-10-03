@@ -8,9 +8,9 @@ typing-extensions==4.9.0
 starlette==0.35.1
 
 # LiveKit dependencies
-livekit-server-sdk==2.0.3
-livekit-protocol==1.4.1
-aiohttp==3.9.3
-python-jose==3.3.0  # For token generation
-cryptography==42.0.2
-python-dotenv==1.0.0
+livekit-server-sdk
+livekit-protocol
+aiohttp
+python-jose
+cryptography
+python-dotenv

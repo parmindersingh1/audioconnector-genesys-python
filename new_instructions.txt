@@ -1,0 +1,6 @@
+cd python-sdks/livekit-protocol
+pip install .
+
+
+python agent_medi_service.py
+npm run test
