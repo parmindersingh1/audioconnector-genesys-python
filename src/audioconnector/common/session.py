@@ -15,9 +15,7 @@ from ..protocol.voice_bots import (
     EventEntityBotTurnResponse
 )
 from ..websocket.message_handlers.message_handler_registry import MessageHandlerRegistry
-from ..services.bot_service import BotService, BotResource, BotResponse
-from ..services.asr_service import ASRService, Transcript
-from ..services.dtmf_service import DTMFService
+from ..services.pipecat_service import PipecatService
 
 class Session:
     def __init__(self, ws: WebSocket, session_id: str, url: str):
@@ -27,9 +25,7 @@ class Session:
         self.ws = ws
 
         self.message_handler_registry = MessageHandlerRegistry()
-        self.bot_service = BotService()
-        self.asr_service: Optional[ASRService] = None
-        self.dtmf_service: Optional[DTMFService] = None
+        self.pipecat_service: Optional[PipecatService] = None
         self.url = url
         self.client_session_id = session_id
         self.conversation_id: Optional[str] = None
@@ -37,7 +33,6 @@ class Session:
         self.last_client_sequence_number = 0
         self.input_variables: JsonStringMap = {}
         self.selected_media: Optional[MediaParameter] = None
-        self.selected_bot: Optional[BotResource] = None
         self.is_capturing_dtmf = False
         self.is_audio_playing = False
         self.logger = logging.getLogger(__name__)
@@ -46,6 +41,9 @@ class Session:
         """Close the WebSocket connection"""
         if self.closed:
             return
+
+        if self.pipecat_service:
+            await self.pipecat_service.stop()
 
         try:
             await self.ws.close()
@@ -190,21 +188,13 @@ class Session:
 
     async def check_if_bot_exists(self) -> bool:
         """Check if bot exists"""
-        selected_bot = await self.bot_service.get_bot_if_exists(self.url, self.input_variables)
-        self.selected_bot = selected_bot
-        return self.selected_bot is not None
+        return True  # Pipecat always "exists"
 
     async def process_bot_start(self):
         """Process bot start"""
-        if not self.selected_bot:
-            return
-
-        response = await self.selected_bot.get_initial_response()
-        if response.text:
-            await self.send_turn_response(response.disposition, response.text, response.confidence)
-
-        if response.audio_bytes:
-            await self.send_audio(response.audio_bytes)
+        if not self.pipecat_service:
+            self.pipecat_service = PipecatService(self)
+        await self.pipecat_service.start()
 
     async def process_binary_message(self, data: bytes):
         """
@@ -213,31 +203,17 @@ class Session:
         Args:
             data: Binary audio data
         """
-        if self.disconnecting or self.closed or not self.selected_bot:
-            return
-
-        # Ignore audio if capturing DTMF
-        if self.is_capturing_dtmf:
+        if self.disconnecting or self.closed:
             return
 
         # Ignore input while audio is playing
         if self.is_audio_playing:
-            self.asr_service = None
-            self.dtmf_service = None
             return
 
-        # Initialize or reset ASR service
-        if not self.asr_service or self.asr_service.get_state() == 'Complete':
-            self.asr_service = ASRService()
-            
-            # Error handling
-            self.asr_service.on('error', self._handle_asr_error)
-            
-            # Final transcript handling
-            self.asr_service.on('final-transcript', self._handle_final_transcript)
-
-        # Process audio
-        self.asr_service.process_audio(data)
+        if self.pipecat_service:
+            await self.pipecat_service.send_user_audio(data)
+        else:
+            self.logger.warning("Pipecat not started; ignoring audio.")
 
     def process_dtmf(self, digit: str):
         """
@@ -246,80 +222,4 @@ class Session:
         Args:
             digit: DTMF digit received
         """
-        if self.disconnecting or self.closed or not self.selected_bot:
-            return
-
-        # Ignore input while audio is playing
-        if self.is_audio_playing:
-            self.asr_service = None
-            self.dtmf_service = None
-            return
-
-        # If we are not capturing DTMF, start capturing
-        if not self.is_capturing_dtmf:
-            self.is_capturing_dtmf = True
-            self.asr_service = None
-
-        if not self.dtmf_service or self.dtmf_service.get_state() == 'Complete':
-            self.dtmf_service = DTMFService()
-            
-            # Error handling
-            self.dtmf_service.on('error', self._handle_dtmf_error)
-            
-            # Final digits handling
-            self.dtmf_service.on('final-digits', self._handle_final_dtmf)
-
-        # Process digit
-        self.dtmf_service.process_digit(digit)
-
-    async def _handle_asr_error(self, error: Any):
-        """Handle ASR service errors"""
-        if self.is_capturing_dtmf:
-            return
-        
-        message = 'Error during Speech Recognition.'
-        self.logger.error(f"{message}: {error}")
-        await self.send_disconnect('error', message, {})
-
-    async def _handle_final_transcript(self, transcript: Transcript):
-        """Handle final transcript from ASR"""
-        if self.is_capturing_dtmf:
-            return
-        
-        if not self.selected_bot:
-            return
-
-        response = await self.selected_bot.get_bot_response(transcript.text)
-        
-        if response.text:
-            await self.send_turn_response(response.disposition, response.text, response.confidence)
-
-        if response.audio_bytes:
-            await self.send_audio(response.audio_bytes)
-
-        if response.end_session:
-            await self.send_disconnect('completed', '', {})
-
-    async def _handle_dtmf_error(self, error: Any):
-        """Handle DTMF service errors"""
-        message = 'Error during DTMF Capture.'
-        self.logger.error(f"{message}: {error}")
-        await self.send_disconnect('error', message, {})
-
-    async def _handle_final_dtmf(self, digits: str):
-        """Handle final DTMF digits"""
-        if not self.selected_bot:
-            return
-
-        response = await self.selected_bot.get_bot_response(digits)
-        
-        if response.text:
-            await self.send_turn_response(response.disposition, response.text, response.confidence)
-
-        if response.audio_bytes:
-            await self.send_audio(response.audio_bytes)
-
-        if response.end_session:
-            await self.send_disconnect('completed', '', {})
-
-        self.is_capturing_dtmf = False
+        self.logger.info(f"Ignoring DTMF digit: {digit}")
