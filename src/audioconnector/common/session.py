@@ -1,6 +1,7 @@
 import json
 import logging
 from typing import Dict, Any, Optional, Union, List
+from uuid import uuid4
 
 from fastapi import WebSocket
 
@@ -35,6 +36,7 @@ class Session:
         self.selected_media: Optional[MediaParameter] = None
         self.is_capturing_dtmf = False
         self.is_audio_playing = False
+        self.is_bot_speaking = False  # Track bot speaking state
         self.logger = logging.getLogger(__name__)
 
     async def close(self):
@@ -67,6 +69,10 @@ class Session:
     def set_is_audio_playing(self, is_audio_playing: bool):
         """Set audio playing status"""
         self.is_audio_playing = is_audio_playing
+
+    def set_is_bot_speaking(self, is_speaking: bool):
+        """Set bot speaking status"""
+        self.is_bot_speaking = is_speaking
 
     async def process_text_message(self, data: str):
         """Process incoming text message"""
@@ -143,8 +149,57 @@ class Session:
                 await self.ws.send_bytes(send_bytes)
                 current_position += self.MAXIMUM_BINARY_MESSAGE_SIZE
 
+    async def send_transcript(self, text: str, is_final: bool, role: str = "user", confidence: float = 0.9):
+        """
+        Send transcript event to Genesys
+        
+        Args:
+            text: The transcript text
+            is_final: Whether this is a final transcript
+            role: "user" or "agent"
+            confidence: Confidence score (0.0 to 1.0)
+        """
+        if not self.selected_media or not self.selected_media.get('channels'):
+            self.logger.warning("Cannot send transcript: no media channel selected")
+            return
+
+        # Genesys expects channelId: 0 for customer, 1 for agent
+        channel_id = 0 if role == "user" else 1
+        
+        transcript_data = {
+            'id': str(uuid4()),
+            'channelId': channel_id,
+            'isFinal': is_final,
+            'alternatives': [
+                {
+                    'confidence': confidence,
+                    'interpretations': [
+                        {
+                            'type': 'normalized',
+                            'transcript': text
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        transcript_event = {
+            'type': 'transcript',
+            'data': transcript_data
+        }
+        
+        message = self.create_message('event', {
+            'entities': [transcript_event]
+        })
+        
+        await self.send(message)
+        self.logger.info(f"Sent transcript: '{text}' (final={is_final}, role={role})")
+
     async def send_barge_in(self):
-        """Send barge-in event"""
+        """
+        Send barge-in event when user interrupts the bot
+        According to Genesys docs: https://developer.genesys.cloud/devapps/audiohook/protocol-reference#bargein
+        """
         barge_in_event: EventEntityBargeIn = {
             'type': 'barge_in',
             'data': {}
@@ -153,6 +208,11 @@ class Session:
             'entities': [barge_in_event]
         })
         await self.send(message)
+        self.logger.info("Sent barge-in event")
+        
+        # Clear bot speaking state
+        self.set_is_bot_speaking(False)
+        self.set_is_audio_playing(False)
 
     async def send_turn_response(self, disposition: BotTurnDisposition, text: Optional[str], confidence: Optional[float]):
         """Send bot turn response event"""
@@ -198,7 +258,7 @@ class Session:
 
     async def process_binary_message(self, data: bytes):
         """
-        Process incoming binary message (audio)
+        Process incoming binary message (audio from user)
         
         Args:
             data: Binary audio data
@@ -206,8 +266,13 @@ class Session:
         if self.disconnecting or self.closed:
             return
 
-        # Ignore input while audio is playing
-        if self.is_audio_playing:
+        # If bot is speaking and user starts speaking, send barge-in
+        if self.is_bot_speaking or self.is_audio_playing:
+            self.logger.info("User interrupted bot - sending barge-in")
+            await self.send_barge_in()
+
+        # Ignore input while capturing DTMF
+        if self.is_capturing_dtmf:
             return
 
         if self.pipecat_service:
@@ -223,3 +288,23 @@ class Session:
             digit: DTMF digit received
         """
         self.logger.info(f"Ignoring DTMF digit: {digit}")
+
+    # Pipecat event handlers (to be called by PipecatService)
+    async def on_pipecat_transcript(self, text: str, is_final: bool, role: str):
+        """Handle transcript from Pipecat"""
+        confidence = 0.98 if is_final else 0.85
+        await self.send_transcript(text, is_final, role, confidence)
+
+    async def on_pipecat_bot_started_speaking(self):
+        """Handle bot started speaking event"""
+        self.set_is_bot_speaking(True)
+        self.logger.info("Bot started speaking")
+
+    async def on_pipecat_bot_stopped_speaking(self):
+        """Handle bot stopped speaking event"""
+        self.set_is_bot_speaking(False)
+        self.logger.info("Bot stopped speaking")
+
+    async def on_pipecat_bot_response(self, text: str):
+        """Handle bot response"""
+        await self.send_turn_response('match', text, 1.0)
