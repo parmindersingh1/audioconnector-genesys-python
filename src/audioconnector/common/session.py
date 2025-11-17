@@ -1,6 +1,7 @@
 import json
 import logging
 from typing import Dict, Any, Optional, Union, List
+from uuid import uuid4
 
 from fastapi import WebSocket
 
@@ -15,9 +16,7 @@ from ..protocol.voice_bots import (
     EventEntityBotTurnResponse
 )
 from ..websocket.message_handlers.message_handler_registry import MessageHandlerRegistry
-from ..services.bot_service import BotService, BotResource, BotResponse
-from ..services.asr_service import ASRService, Transcript
-from ..services.dtmf_service import DTMFService
+from ..services.pipecat_service import PipecatService
 
 class Session:
     def __init__(self, ws: WebSocket, session_id: str, url: str):
@@ -27,9 +26,7 @@ class Session:
         self.ws = ws
 
         self.message_handler_registry = MessageHandlerRegistry()
-        self.bot_service = BotService()
-        self.asr_service: Optional[ASRService] = None
-        self.dtmf_service: Optional[DTMFService] = None
+        self.pipecat_service: Optional[PipecatService] = None
         self.url = url
         self.client_session_id = session_id
         self.conversation_id: Optional[str] = None
@@ -37,15 +34,18 @@ class Session:
         self.last_client_sequence_number = 0
         self.input_variables: JsonStringMap = {}
         self.selected_media: Optional[MediaParameter] = None
-        self.selected_bot: Optional[BotResource] = None
         self.is_capturing_dtmf = False
         self.is_audio_playing = False
+        self.is_bot_speaking = False  # Track bot speaking state
         self.logger = logging.getLogger(__name__)
 
     async def close(self):
         """Close the WebSocket connection"""
         if self.closed:
             return
+
+        if self.pipecat_service:
+            await self.pipecat_service.stop()
 
         try:
             await self.ws.close()
@@ -69,6 +69,10 @@ class Session:
     def set_is_audio_playing(self, is_audio_playing: bool):
         """Set audio playing status"""
         self.is_audio_playing = is_audio_playing
+
+    def set_is_bot_speaking(self, is_speaking: bool):
+        """Set bot speaking status"""
+        self.is_bot_speaking = is_speaking
 
     async def process_text_message(self, data: str):
         """Process incoming text message"""
@@ -145,8 +149,57 @@ class Session:
                 await self.ws.send_bytes(send_bytes)
                 current_position += self.MAXIMUM_BINARY_MESSAGE_SIZE
 
+    async def send_transcript(self, text: str, is_final: bool, role: str = "user", confidence: float = 0.9):
+        """
+        Send transcript event to Genesys
+        
+        Args:
+            text: The transcript text
+            is_final: Whether this is a final transcript
+            role: "user" or "agent"
+            confidence: Confidence score (0.0 to 1.0)
+        """
+        if not self.selected_media or not self.selected_media.get('channels'):
+            self.logger.warning("Cannot send transcript: no media channel selected")
+            return
+
+        # Genesys expects channelId: 0 for customer, 1 for agent
+        channel_id = 0 if role == "user" else 1
+        
+        transcript_data = {
+            'id': str(uuid4()),
+            'channelId': channel_id,
+            'isFinal': is_final,
+            'alternatives': [
+                {
+                    'confidence': confidence,
+                    'interpretations': [
+                        {
+                            'type': 'normalized',
+                            'transcript': text
+                        }
+                    ]
+                }
+            ]
+        }
+        
+        transcript_event = {
+            'type': 'transcript',
+            'data': transcript_data
+        }
+        
+        message = self.create_message('event', {
+            'entities': [transcript_event]
+        })
+        
+        await self.send(message)
+        self.logger.info(f"Sent transcript: '{text}' (final={is_final}, role={role})")
+
     async def send_barge_in(self):
-        """Send barge-in event"""
+        """
+        Send barge-in event when user interrupts the bot
+        According to Genesys docs: https://developer.genesys.cloud/devapps/audiohook/protocol-reference#bargein
+        """
         barge_in_event: EventEntityBargeIn = {
             'type': 'barge_in',
             'data': {}
@@ -155,6 +208,11 @@ class Session:
             'entities': [barge_in_event]
         })
         await self.send(message)
+        self.logger.info("Sent barge-in event")
+        
+        # Clear bot speaking state
+        self.set_is_bot_speaking(False)
+        self.set_is_audio_playing(False)
 
     async def send_turn_response(self, disposition: BotTurnDisposition, text: Optional[str], confidence: Optional[float]):
         """Send bot turn response event"""
@@ -190,54 +248,37 @@ class Session:
 
     async def check_if_bot_exists(self) -> bool:
         """Check if bot exists"""
-        selected_bot = await self.bot_service.get_bot_if_exists(self.url, self.input_variables)
-        self.selected_bot = selected_bot
-        return self.selected_bot is not None
+        return True  # Pipecat always "exists"
 
     async def process_bot_start(self):
         """Process bot start"""
-        if not self.selected_bot:
-            return
-
-        response = await self.selected_bot.get_initial_response()
-        if response.text:
-            await self.send_turn_response(response.disposition, response.text, response.confidence)
-
-        if response.audio_bytes:
-            await self.send_audio(response.audio_bytes)
+        if not self.pipecat_service:
+            self.pipecat_service = PipecatService(self)
+        await self.pipecat_service.start()
 
     async def process_binary_message(self, data: bytes):
         """
-        Process incoming binary message (audio)
+        Process incoming binary message (audio from user)
         
         Args:
             data: Binary audio data
         """
-        if self.disconnecting or self.closed or not self.selected_bot:
+        if self.disconnecting or self.closed:
             return
 
-        # Ignore audio if capturing DTMF
+        # If bot is speaking and user starts speaking, send barge-in
+        if self.is_bot_speaking or self.is_audio_playing:
+            self.logger.info("User interrupted bot - sending barge-in")
+            await self.send_barge_in()
+
+        # Ignore input while capturing DTMF
         if self.is_capturing_dtmf:
             return
 
-        # Ignore input while audio is playing
-        if self.is_audio_playing:
-            self.asr_service = None
-            self.dtmf_service = None
-            return
-
-        # Initialize or reset ASR service
-        if not self.asr_service or self.asr_service.get_state() == 'Complete':
-            self.asr_service = ASRService()
-            
-            # Error handling
-            self.asr_service.on('error', self._handle_asr_error)
-            
-            # Final transcript handling
-            self.asr_service.on('final-transcript', self._handle_final_transcript)
-
-        # Process audio
-        self.asr_service.process_audio(data)
+        if self.pipecat_service:
+            await self.pipecat_service.send_user_audio(data)
+        else:
+            self.logger.warning("Pipecat not started; ignoring audio.")
 
     def process_dtmf(self, digit: str):
         """
@@ -246,80 +287,24 @@ class Session:
         Args:
             digit: DTMF digit received
         """
-        if self.disconnecting or self.closed or not self.selected_bot:
-            return
+        self.logger.info(f"Ignoring DTMF digit: {digit}")
 
-        # Ignore input while audio is playing
-        if self.is_audio_playing:
-            self.asr_service = None
-            self.dtmf_service = None
-            return
+    # Pipecat event handlers (to be called by PipecatService)
+    async def on_pipecat_transcript(self, text: str, is_final: bool, role: str):
+        """Handle transcript from Pipecat"""
+        confidence = 0.98 if is_final else 0.85
+        await self.send_transcript(text, is_final, role, confidence)
 
-        # If we are not capturing DTMF, start capturing
-        if not self.is_capturing_dtmf:
-            self.is_capturing_dtmf = True
-            self.asr_service = None
+    async def on_pipecat_bot_started_speaking(self):
+        """Handle bot started speaking event"""
+        self.set_is_bot_speaking(True)
+        self.logger.info("Bot started speaking")
 
-        if not self.dtmf_service or self.dtmf_service.get_state() == 'Complete':
-            self.dtmf_service = DTMFService()
-            
-            # Error handling
-            self.dtmf_service.on('error', self._handle_dtmf_error)
-            
-            # Final digits handling
-            self.dtmf_service.on('final-digits', self._handle_final_dtmf)
+    async def on_pipecat_bot_stopped_speaking(self):
+        """Handle bot stopped speaking event"""
+        self.set_is_bot_speaking(False)
+        self.logger.info("Bot stopped speaking")
 
-        # Process digit
-        self.dtmf_service.process_digit(digit)
-
-    async def _handle_asr_error(self, error: Any):
-        """Handle ASR service errors"""
-        if self.is_capturing_dtmf:
-            return
-        
-        message = 'Error during Speech Recognition.'
-        self.logger.error(f"{message}: {error}")
-        await self.send_disconnect('error', message, {})
-
-    async def _handle_final_transcript(self, transcript: Transcript):
-        """Handle final transcript from ASR"""
-        if self.is_capturing_dtmf:
-            return
-        
-        if not self.selected_bot:
-            return
-
-        response = await self.selected_bot.get_bot_response(transcript.text)
-        
-        if response.text:
-            await self.send_turn_response(response.disposition, response.text, response.confidence)
-
-        if response.audio_bytes:
-            await self.send_audio(response.audio_bytes)
-
-        if response.end_session:
-            await self.send_disconnect('completed', '', {})
-
-    async def _handle_dtmf_error(self, error: Any):
-        """Handle DTMF service errors"""
-        message = 'Error during DTMF Capture.'
-        self.logger.error(f"{message}: {error}")
-        await self.send_disconnect('error', message, {})
-
-    async def _handle_final_dtmf(self, digits: str):
-        """Handle final DTMF digits"""
-        if not self.selected_bot:
-            return
-
-        response = await self.selected_bot.get_bot_response(digits)
-        
-        if response.text:
-            await self.send_turn_response(response.disposition, response.text, response.confidence)
-
-        if response.audio_bytes:
-            await self.send_audio(response.audio_bytes)
-
-        if response.end_session:
-            await self.send_disconnect('completed', '', {})
-
-        self.is_capturing_dtmf = False
+    async def on_pipecat_bot_response(self, text: str):
+        """Handle bot response"""
+        await self.send_turn_response('match', text, 1.0)

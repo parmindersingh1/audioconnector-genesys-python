@@ -63,14 +63,16 @@ async def startup_event():
     logger.info(os.getenv('PORT'))
     logger.info("*****************")
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+# @app.websocket("/ws")
+@app.websocket("/intelliconverse/tel:{phone_number}")
+async def websocket_endpoint(websocket: WebSocket, phone_number: str):
     """
     WebSocket endpoint for handling connections
     
     Args:
         websocket: Incoming WebSocket connection
     """
+    logger.info(f"WebSocket connection initiated for phone number: {phone_number}")
     ws_server = WebSocketServer()
     await ws_server.handle_websocket(websocket)
 

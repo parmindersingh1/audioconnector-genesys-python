@@ -19,4 +19,5 @@ class PingMessageHandler(MessageHandler):
             session: Current session object
         """
         self.logger.info("Received ping message")
-        # In a real implementation, you might want to send a pong or perform health checks
+        pong_message = session.create_message('pong', {})
+        await session.send(pong_message)

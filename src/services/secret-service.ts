@@ -11,6 +11,7 @@ export class SecretService {
 
     static {
         SecretService.secrets.set('ApiKey1', 'Secret1');
+        SecretService.secrets.set('ApiKey2', '5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8');
     }
 
     getSecretForKey(key: string): Uint8Array {

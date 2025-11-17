@@ -40,3 +40,11 @@ Thumbs.db
 *.mov
 *.wmv
 .env
+venv/
+.venv/
+.pyrc
+__pycache__/*
+*.pyc
+*.pyo
+*.pyd
+src/audioconnector/common/__pycache__/*

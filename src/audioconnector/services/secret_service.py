@@ -7,7 +7,7 @@ class SecretService:
     """
     _secrets = {
         'ApiKey1': 'Secret1',
-        'ApiKey2': 'gx_4k8n2m9p6r3s7t1v5w8x2y4z6a9b3c7d1e5f8g2h6i0j4k7l1m9n3o6p2q8r5s1t7u4v0w6x9y3z8'
+        'ApiKey2': '5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8'
     }
 
     def get_secret_for_key(self, key: str) -> bytes:
